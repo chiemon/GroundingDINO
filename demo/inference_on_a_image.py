@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import re
 
 import numpy as np
 import torch
@@ -12,9 +13,10 @@ from groundingdino.util import box_ops
 from groundingdino.util.slconfig import SLConfig
 from groundingdino.util.utils import clean_state_dict, get_phrases_from_posmap
 from groundingdino.util.vl_utils import create_positive_map_from_span
+from groundingdino.models.GroundingDINO.post_process import PostProcess
 
 
-def plot_boxes_to_image(image_pil, tgt):
+def plot_boxes_to_image(image_pil, tgt, use_absolute_coordinates=False):
     H, W = tgt["size"]
     boxes = tgt["boxes"]
     labels = tgt["labels"]
@@ -40,7 +42,8 @@ def plot_boxes_to_image(image_pil, tgt):
         draw.rectangle([x0, y0, x1, y1], outline=color, width=6)
         # draw.text((x0, y0), str(label), fill=color)
 
-        font = ImageFont.load_default()
+        font = ImageFont.truetype("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", size=16)
+        # font = ImageFont.load_default()
         if hasattr(font, "getbbox"):
             bbox = draw.textbbox((x0, y0), str(label), font)
         else:
@@ -48,7 +51,7 @@ def plot_boxes_to_image(image_pil, tgt):
             bbox = (x0, y0, w + x0, y0 + h)
         # bbox = draw.textbbox((x0, y0), str(label))
         draw.rectangle(bbox, fill=color)
-        draw.text((x0, y0), str(label), fill="white")
+        draw.text((x0, y0), str(label), fill="white", font=font)
 
         mask_draw.rectangle([x0, y0, x1, y1], fill=255, width=6)
 
@@ -81,17 +84,40 @@ def load_model(model_config_path, model_checkpoint_path, cpu_only=False):
     return model
 
 
-def get_grounding_output(model, image, caption, box_threshold, text_threshold=None, with_logits=True, cpu_only=False, token_spans=None):
+def get_grounding_output(model, image, caption, box_threshold, text_threshold=None, with_logits=True, cpu_only=False,
+                         token_spans=None, **kw):
     assert text_threshold is not None or token_spans is not None, "text_threshould and token_spans should not be None at the same time!"
-    caption = caption.lower()
-    caption = caption.strip()
-    if not caption.endswith("."):
-        caption = caption + "."
+    text_prompt = caption
+    if token_spans is not None:
+        caption = caption.lower()
+        caption = caption.strip()
+        if not caption.endswith("."):
+            caption = caption + "."
     device = "cuda" if not cpu_only else "cpu"
     model = model.to(device)
     image = image.to(device)
     with torch.no_grad():
         outputs = model(image[None], captions=[caption])
+    if model.use_cn_clip_bert:
+        input_captions = [caption]
+        postprocessor = PostProcess(num_select=300, nms_iou_threshold=-1)
+        results = postprocessor(outputs=outputs, ori_captions=input_captions, image_ids=[1],
+                                not_to_xyxy=True, use_absolute_coordinates=False)
+        # {'scores': s, 'labels': l, 'boxes': b, 'texts': t, 'image_ids': d}
+        scores = results[0]['scores'].cpu().clone()
+        boxes = results[0]['boxes'].cpu().clone()
+        texts = results[0]['texts']
+
+        mask = scores > args.box_threshold
+        scores = scores[mask]
+        boxes = boxes[mask]
+        texts = [texts[idx] for idx, m in enumerate(mask) if m]
+
+        pred_phrases = []
+        for score, text in zip(scores, texts):
+            pred_phrases.append(text + f"({str(score.cpu().numpy() * 100)[:4]}%)")
+        return boxes, pred_phrases
+
     logits = outputs["pred_logits"].sigmoid()[0]  # (nq, 256)
     boxes = outputs["pred_boxes"][0]  # (nq, 4)
 
@@ -181,27 +207,29 @@ if __name__ == "__main__":
     text_threshold = args.text_threshold
     token_spans = args.token_spans
 
+    # load model
+    model = load_model(config_file, checkpoint_path, cpu_only=args.cpu_only)
+
     # make dir
     os.makedirs(output_dir, exist_ok=True)
     # load image
     image_pil, image = load_image(image_path)
-    # load model
-    model = load_model(config_file, checkpoint_path, cpu_only=args.cpu_only)
-
-    # visualize raw image
-    image_pil.save(os.path.join(output_dir, "raw_image.jpg"))
 
     # set the text_threshold to None if token_spans is set.
     if token_spans is not None:
         text_threshold = None
         print("Using token_spans. Set the text_threshold to None.")
-
+    else:
+        text_prompt = text_prompt.split()
 
     # run model
     boxes_filt, pred_phrases = get_grounding_output(
-        model, image, text_prompt, box_threshold, text_threshold, cpu_only=args.cpu_only, token_spans=eval(token_spans)
+        model, image, text_prompt, box_threshold, text_threshold, cpu_only=args.cpu_only,
+        token_spans=eval(token_spans) if token_spans is not None else token_spans
     )
 
+    # visualize raw image
+    # image_pil.save(os.path.join(output_dir, "raw_image.jpg"))
     # visualize pred
     size = image_pil.size
     pred_dict = {

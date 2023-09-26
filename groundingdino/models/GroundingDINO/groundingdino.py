@@ -15,6 +15,7 @@
 # Copyright (c) 2020 SenseTime. All Rights Reserved.
 # ------------------------------------------------------------------------
 import copy
+import os
 from typing import List
 
 import torch
@@ -74,6 +75,13 @@ class GroundingDINO(nn.Module):
         text_encoder_type="bert-base-uncased",
         sub_sentence_present=True,
         max_text_len=256,
+        use_pre_text_embeddings=False,
+        pre_text_embeddings_path=None,
+        dec_pred_iou_embed_share=True,
+        use_iou_aware=False,
+        use_cn_clip_bert=False,
+        cn_clip_pretrain_path=None,
+        cn_clip_use_checkpoint=False,
     ):
         """Initializes the model.
         Parameters:
@@ -83,6 +91,7 @@ class GroundingDINO(nn.Module):
                          Conditional DETR can detect in a single image. For COCO, we recommend 100 queries.
             aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
         """
+        global feat_map_in_channel
         super().__init__()
         self.num_queries = num_queries
         self.transformer = transformer
@@ -91,6 +100,8 @@ class GroundingDINO(nn.Module):
         self.nheads = nheads
         self.max_text_len = 256
         self.sub_sentence_present = sub_sentence_present
+        self.use_iou_aware = use_iou_aware
+        self.use_pre_text_embeddings = use_pre_text_embeddings
 
         # setting query dim
         self.query_dim = query_dim
@@ -104,19 +115,46 @@ class GroundingDINO(nn.Module):
         self.dn_labelbook_size = dn_labelbook_size
 
         # bert
-        self.tokenizer = get_tokenlizer.get_tokenlizer(text_encoder_type)
-        self.bert = get_tokenlizer.get_pretrained_language_model(text_encoder_type)
-        self.bert.pooler.dense.weight.requires_grad_(False)
-        self.bert.pooler.dense.bias.requires_grad_(False)
-        self.bert = BertModelWarper(bert_model=self.bert)
+        self.use_cn_clip_bert = use_cn_clip_bert
+        if not use_pre_text_embeddings:
+            if not use_cn_clip_bert:
+                self.tokenizer = get_tokenlizer.get_tokenlizer(text_encoder_type)
+                self.bert = get_tokenlizer.get_pretrained_language_model(text_encoder_type)
+                self.bert.pooler.dense.weight.requires_grad_(False)
+                self.bert.pooler.dense.bias.requires_grad_(False)
+                self.bert = BertModelWarper(bert_model=self.bert)
+                feat_map_in_channel = self.bert.config.hidden_size
+            else:
+                from .cn_clip_roberta import build_cn_toberta
+                self.tokenizer, self.bert = build_cn_toberta(
+                    use_checkpoint=cn_clip_use_checkpoint,
+                    pretrain_path=cn_clip_pretrain_path
+                )
+                feat_map_in_channel = self.bert.embed_dim
+                vectors = torch.empty(feat_map_in_channel, dtype=torch.float32)
+                nn.init.normal_(vectors, std=0.02)
+                self.padding = nn.Parameter(vectors, )
+        else:
+            assert not self.use_cn_clip_bert, f'Please verify whether use cn_clip_bert.'
+            self.tokenizer, self.bert = None, None
 
-        self.feat_map = nn.Linear(self.bert.config.hidden_size, self.hidden_dim, bias=True)
+            assert os.path.exists(pre_text_embeddings_path)
+            text2feat = torch.load(pre_text_embeddings_path, map_location='cpu')
+            for k, v in text2feat.items():
+                self.register_buffer(k, v.type(dtype=torch.float32))  # register embeddings
+                feat_map_in_channel = v.shape[0]  # 768
+            vectors = torch.empty(feat_map_in_channel, dtype=torch.float32)
+            nn.init.normal_(vectors, std=0.02)
+            self.padding = nn.Parameter(vectors, )
+
+        self.feat_map = nn.Linear(feat_map_in_channel, self.hidden_dim, bias=True)
         nn.init.constant_(self.feat_map.bias.data, 0)
         nn.init.xavier_uniform_(self.feat_map.weight.data)
         # freeze
 
         # special tokens
-        self.specical_tokens = self.tokenizer.convert_tokens_to_ids(["[CLS]", "[SEP]", ".", "?"])
+        self.specical_tokens = self.tokenizer.convert_tokens_to_ids(
+            ["[CLS]", "[SEP]", ".", "?"]) if (not use_pre_text_embeddings and not use_cn_clip_bert) else None
 
         # prepare input projection layers
         if num_feature_levels > 1:
@@ -159,12 +197,23 @@ class GroundingDINO(nn.Module):
 
         # prepare pred layers
         self.dec_pred_bbox_embed_share = dec_pred_bbox_embed_share
+        self.dec_pred_iou_embed_share = dec_pred_iou_embed_share
         # prepare class & box embed
         _class_embed = ContrastiveEmbed()
 
         _bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         nn.init.constant_(_bbox_embed.layers[-1].weight.data, 0)
         nn.init.constant_(_bbox_embed.layers[-1].bias.data, 0)
+        if self.use_iou_aware:
+            _iou_embed = MLP(hidden_dim, hidden_dim, 1, 2)
+            nn.init.constant_(_iou_embed.layers[-1].weight.data, 0)
+            nn.init.constant_(_iou_embed.layers[-1].bias.data, 0)
+            if dec_pred_iou_embed_share:
+                iou_embed_layerlist = [_iou_embed for i in range(transformer.num_decoder_layers)]
+            else:
+                iou_embed_layerlist = [
+                    copy.deepcopy(_iou_embed) for i in range(transformer.num_decoder_layers)
+                ]
 
         if dec_pred_bbox_embed_share:
             box_embed_layerlist = [_bbox_embed for i in range(transformer.num_decoder_layers)]
@@ -175,6 +224,7 @@ class GroundingDINO(nn.Module):
         class_embed_layerlist = [_class_embed for i in range(transformer.num_decoder_layers)]
         self.bbox_embed = nn.ModuleList(box_embed_layerlist)
         self.class_embed = nn.ModuleList(class_embed_layerlist)
+        self.iou_embed = nn.ModuleList(iou_embed_layerlist) if self.use_iou_aware else None
         self.transformer.decoder.bbox_embed = self.bbox_embed
         self.transformer.decoder.class_embed = self.class_embed
 
@@ -215,7 +265,7 @@ class GroundingDINO(nn.Module):
         if hasattr(self, 'features'):
             del self.features
         if hasattr(self,'poss'):
-            del self.poss 
+            del self.poss
 
     def set_image_features(self, features , poss):
         self.features = features
@@ -223,6 +273,50 @@ class GroundingDINO(nn.Module):
 
     def init_ref_points(self, use_num_queries):
         self.refpoint_embed = nn.Embedding(use_num_queries, self.query_dim)
+
+    def extract_text_feat_by_cn_bert(self, samples, targets: List, **kw):
+        embeddings = []
+        if targets is None:
+            captions = kw.get('captions')
+        else:
+            captions = [target['ori_caption'] for target in targets]
+
+        max_len = max([len(cap) for cap in captions])
+        batch_size = len(captions)
+        if self.training:
+            max_len += 1
+        text_self_attention_masks = (
+            torch.eye(max_len, device=samples.device).bool().unsqueeze(0).repeat(batch_size, 1, 1)
+        )
+        cate_to_token_mask_list = []
+        text_token_mask = torch.ones((batch_size, max_len), dtype=text_self_attention_masks.dtype,
+                                     device=samples.device)
+        for bidx, caption in enumerate(captions):
+            text_tokens = self.tokenizer(caption).to(samples.device)
+            embedding = self.bert(text_tokens, dtype=self.feat_map.weight.dtype) # N * C
+            text_self_attention_masks[bidx, len(embedding):, len(embedding):] = True
+            c2t_maski = torch.eye(max_len, device=samples.device).bool()
+            c2t_maski[len(embedding):, len(embedding):] = False
+            text_token_mask[bidx, len(embedding):] = 0.  # padding mask to 0
+            cate_to_token_mask_list.append(c2t_maski)
+            padding_embedding = []
+            for _ in range(max_len - embedding.shape[0]):
+                padding_embedding.append(self.padding)  # pad to same length
+            if padding_embedding:
+                padding_embedding = torch.stack(padding_embedding)
+                embedding = torch.cat([embedding, padding_embedding], dim=0) # N, C
+            assert embedding.shape[0] == max_len
+            embeddings.append(embedding)
+        encoded_text = torch.stack(embeddings)  # B, N, C
+        encoded_text = self.feat_map(encoded_text)  # bs, 195, d_model
+        text_dict = {
+            "encoded_text": encoded_text,  # bs, 195, d_model
+            "position_ids": torch.zeros((len(captions), max_len), device=samples.device),
+            "text_token_mask": text_token_mask.bool(),
+            "text_self_attention_masks": text_self_attention_masks,  # bs, 195,195
+            "cate_to_token_mask_list": cate_to_token_mask_list,
+        }
+        return encoded_text, text_dict
 
     def forward(self, samples: NestedTensor, targets: List = None, **kw):
         """The forward expects a NestedTensor, which consists of:
@@ -239,64 +333,133 @@ class GroundingDINO(nn.Module):
            - "aux_outputs": Optional, only returned when auxilary losses are activated. It is a list of
                             dictionnaries containing the two above keys for each decoder layer.
         """
-        if targets is None:
-            captions = kw["captions"]
-        else:
-            captions = [t["caption"] for t in targets]
+        if len(self.backbone.num_channels) != 4:
+            if targets is None:
+                captions = kw["captions"]
+            else:
+                captions = [t["caption"] for t in targets]
 
-        # encoder texts
-        tokenized = self.tokenizer(captions, padding="longest", return_tensors="pt").to(
-            samples.device
-        )
-        (
-            text_self_attention_masks,
-            position_ids,
-            cate_to_token_mask_list,
-        ) = generate_masks_with_special_tokens_and_transfer_map(
-            tokenized, self.specical_tokens, self.tokenizer
-        )
+            # encoder texts
+            tokenized = self.tokenizer(captions, padding="longest", return_tensors="pt").to(
+                samples.device
+            )
+            (
+                text_self_attention_masks,
+                position_ids,
+                cate_to_token_mask_list,
+            ) = generate_masks_with_special_tokens_and_transfer_map(
+                tokenized, self.specical_tokens, self.tokenizer
+            )
 
-        if text_self_attention_masks.shape[1] > self.max_text_len:
-            text_self_attention_masks = text_self_attention_masks[
-                :, : self.max_text_len, : self.max_text_len
-            ]
-            position_ids = position_ids[:, : self.max_text_len]
-            tokenized["input_ids"] = tokenized["input_ids"][:, : self.max_text_len]
-            tokenized["attention_mask"] = tokenized["attention_mask"][:, : self.max_text_len]
-            tokenized["token_type_ids"] = tokenized["token_type_ids"][:, : self.max_text_len]
+            if text_self_attention_masks.shape[1] > self.max_text_len:
+                text_self_attention_masks = text_self_attention_masks[
+                    :, : self.max_text_len, : self.max_text_len
+                ]
+                position_ids = position_ids[:, : self.max_text_len]
+                tokenized["input_ids"] = tokenized["input_ids"][:, : self.max_text_len]
+                tokenized["attention_mask"] = tokenized["attention_mask"][:, : self.max_text_len]
+                tokenized["token_type_ids"] = tokenized["token_type_ids"][:, : self.max_text_len]
 
-        # extract text embeddings
-        if self.sub_sentence_present:
-            tokenized_for_encoder = {k: v for k, v in tokenized.items() if k != "attention_mask"}
-            tokenized_for_encoder["attention_mask"] = text_self_attention_masks
-            tokenized_for_encoder["position_ids"] = position_ids
-        else:
+            # extract text embeddings
+            if self.sub_sentence_present:
+                tokenized_for_encoder = {k: v for k, v in tokenized.items() if k != "attention_mask"}
+                tokenized_for_encoder["attention_mask"] = text_self_attention_masks
+                tokenized_for_encoder["position_ids"] = position_ids
+            else:
+                # import ipdb; ipdb.set_trace()
+                tokenized_for_encoder = tokenized
+
+            bert_output = self.bert(**tokenized_for_encoder)  # bs, 195, 768
+
+            encoded_text = self.feat_map(bert_output["last_hidden_state"])  # bs, 195, d_model
+            text_token_mask = tokenized.attention_mask.bool()  # bs, 195
+            # text_token_mask: True for nomask, False for mask
+            # text_self_attention_masks: True for nomask, False for mask
+
+            if encoded_text.shape[1] > self.max_text_len:
+                encoded_text = encoded_text[:, : self.max_text_len, :]
+                text_token_mask = text_token_mask[:, : self.max_text_len]
+                position_ids = position_ids[:, : self.max_text_len]
+                text_self_attention_masks = text_self_attention_masks[
+                    :, : self.max_text_len, : self.max_text_len
+                ]
+
+            text_dict = {
+                "encoded_text": encoded_text,  # bs, 195, d_model
+                "text_token_mask": text_token_mask,  # bs, 195
+                "position_ids": position_ids,  # bs, 195
+                "text_self_attention_masks": text_self_attention_masks,  # bs, 195,195
+            }
+
             # import ipdb; ipdb.set_trace()
-            tokenized_for_encoder = tokenized
+        else:
+            assert targets is None
+            if self.bert is not None:
+                if not self.use_cn_clip_bert:
+                    (bert_output, tokenized, position_ids, text_self_attention_masks,
+                            cate_to_token_mask_list) = self.extract_text_feat_by_bert(samples, targets, **kw)
+                    encoded_text = self.feat_map(bert_output["last_hidden_state"])  # bs, 195, d_model
+                    text_token_mask = tokenized.attention_mask.bool()  # bs, 195
+                    # text_token_mask: True for nomask, False for mask
+                    # text_self_attention_masks: True for nomask, False for mask
+                    if encoded_text.shape[1] > self.max_text_len:
+                        encoded_text = encoded_text[:, : self.max_text_len, :]
+                        text_token_mask = text_token_mask[:, : self.max_text_len]
+                        position_ids = position_ids[:, : self.max_text_len]
+                        text_self_attention_masks = text_self_attention_masks[
+                                                    :, : self.max_text_len, : self.max_text_len
+                                                    ]
+                    text_dict = {
+                        "encoded_text": encoded_text,  # bs, 195, d_model
+                        "text_token_mask": text_token_mask,  # bs, 195
+                        "position_ids": position_ids,  # bs, 195
+                        "text_self_attention_masks": text_self_attention_masks,  # bs, 195,195
+                        "cate_to_token_mask_list": cate_to_token_mask_list,
+                        # bs = len([torch.Tensor(c1, 195), torch.Tensor(c2, 195) ...])
+                    }
+                else:
+                    encoded_text, text_dict = self.extract_text_feat_by_cn_bert(samples=samples, targets=targets, **kw)
+            else:
+                captions = kw.get('captions')
+                assert len(captions) == 1
+                embeddings = []
+                max_len = len(captions[0])
+                text_self_attention_masks = (
+                    torch.eye(max_len, device=samples.device).bool().unsqueeze(0).repeat(len(captions), 1, 1)
+                )
+                cate_to_token_mask_list = []
+                text_token_mask = torch.ones((len(captions), max_len), dtype=text_self_attention_masks.dtype,
+                                            device=samples.device)
 
-        bert_output = self.bert(**tokenized_for_encoder)  # bs, 195, 768
+                embedding = [getattr(self, ori_cap) for ori_cap in captions[0]]
+                text_self_attention_masks[0, len(embedding):, len(embedding):] = True
+                c2t_maski = torch.eye(max_len, device=samples.device).bool()
+                c2t_maski[len(embedding):, len(embedding):] = False
+                text_token_mask[0, len(embedding):] = 0.  # padding mask to 0
+                cate_to_token_mask_list.append(c2t_maski)
 
-        encoded_text = self.feat_map(bert_output["last_hidden_state"])  # bs, 195, d_model
-        text_token_mask = tokenized.attention_mask.bool()  # bs, 195
-        # text_token_mask: True for nomask, False for mask
-        # text_self_attention_masks: True for nomask, False for mask
+                embedding = torch.stack(embedding, dim=0)
+                padding_embedding = []
+                for _ in range(max_len - embedding.shape[0]):
+                    padding_embedding.append(self.padding)  # pad to same length
 
-        if encoded_text.shape[1] > self.max_text_len:
-            encoded_text = encoded_text[:, : self.max_text_len, :]
-            text_token_mask = text_token_mask[:, : self.max_text_len]
-            position_ids = position_ids[:, : self.max_text_len]
-            text_self_attention_masks = text_self_attention_masks[
-                :, : self.max_text_len, : self.max_text_len
-            ]
+                if padding_embedding:
+                    padding_embedding = torch.stack(padding_embedding)
+                    embedding = torch.concat([embedding, padding_embedding], dim=0)  # N, C
 
-        text_dict = {
-            "encoded_text": encoded_text,  # bs, 195, d_model
-            "text_token_mask": text_token_mask,  # bs, 195
-            "position_ids": position_ids,  # bs, 195
-            "text_self_attention_masks": text_self_attention_masks,  # bs, 195,195
-        }
+                assert embedding.shape[0] == max_len
+                embeddings.append(embedding)
 
-        # import ipdb; ipdb.set_trace()
+                encoded_text = torch.stack(embeddings)  # B, N, C
+                encoded_text = self.feat_map(encoded_text)  # bs, 195, d_model
+
+                text_dict = {
+                    "encoded_text": encoded_text,  # bs, 195, d_model
+                    "position_ids": torch.zeros((len(captions), max_len), device=samples.device),
+                    "text_token_mask": text_token_mask.bool(),
+                    "text_self_attention_masks": text_self_attention_masks,  # bs, 195,195
+                    "cate_to_token_mask_list": cate_to_token_mask_list,
+                }
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
         if not hasattr(self, 'features') or not hasattr(self, 'poss'):
@@ -339,6 +502,14 @@ class GroundingDINO(nn.Module):
             outputs_coord_list.append(layer_outputs_unsig)
         outputs_coord_list = torch.stack(outputs_coord_list)
 
+        if self.use_iou_aware:
+            outputs_iou_list = [
+                layer_iou_embd(layer_hs) for layer_iou_embd, layer_hs in zip(self.iou_embed, hs)
+            ]
+            outputs_iou_list = torch.stack(outputs_iou_list)
+        else:
+            outputs_iou_list = None
+
         # output
         outputs_class = torch.stack(
             [
@@ -346,7 +517,12 @@ class GroundingDINO(nn.Module):
                 for layer_cls_embed, layer_hs in zip(self.class_embed, hs)
             ]
         )
-        out = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord_list[-1]}
+        out = {
+            "pred_logits": outputs_class[-1],
+            "pred_boxes": outputs_coord_list[-1],
+            "pred_ious": outputs_iou_list[-1] if outputs_iou_list is not None else None,
+            "text_dict": text_dict
+        }
 
         # # for intermediate outputs
         # if self.aux_loss:
@@ -365,10 +541,15 @@ class GroundingDINO(nn.Module):
         return out
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord):
+    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_iou=None):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
+        if self.use_iou_aware:
+            return [
+                {"pred_logits": a, "pred_boxes": b, "pred_ious": c}
+                for a, b, c in zip(outputs_class[:-1], outputs_coord[:-1], outputs_iou[:-1])
+            ]
         return [
             {"pred_logits": a, "pred_boxes": b}
             for a, b in zip(outputs_class[:-1], outputs_coord[:-1])
@@ -385,6 +566,14 @@ def build_groundingdino(args):
     dec_pred_bbox_embed_share = args.dec_pred_bbox_embed_share
     sub_sentence_present = args.sub_sentence_present
 
+    use_pre_text_embeddings = getattr(args, 'use_pre_text_embeddings', False)
+    pre_text_embeddings_path = getattr(args, 'pre_text_embeddings_path', None)
+    dec_pred_iou_embed_share = getattr(args, 'dec_pred_iou_embed_share', True)
+    use_iou_aware = getattr(args, 'use_iou_aware', False)
+    use_cn_clip_bert = getattr(args, 'use_cn_clip_bert', False)
+    cn_clip_pretrain_path = getattr(args, 'cn_clip_pretrain_path', None)
+    cn_clip_use_checkpoint = getattr(args, 'cn_clip_use_checkpoint', False)
+
     model = GroundingDINO(
         backbone,
         transformer,
@@ -399,14 +588,20 @@ def build_groundingdino(args):
         two_stage_bbox_embed_share=args.two_stage_bbox_embed_share,
         two_stage_class_embed_share=args.two_stage_class_embed_share,
         num_patterns=args.num_patterns,
-        dn_number=0,
+        dn_number=args.dn_number,
         dn_box_noise_scale=args.dn_box_noise_scale,
         dn_label_noise_ratio=args.dn_label_noise_ratio,
         dn_labelbook_size=dn_labelbook_size,
         text_encoder_type=args.text_encoder_type,
         sub_sentence_present=sub_sentence_present,
         max_text_len=args.max_text_len,
+        use_pre_text_embeddings=use_pre_text_embeddings,
+        pre_text_embeddings_path=pre_text_embeddings_path,
+        dec_pred_iou_embed_share=dec_pred_iou_embed_share,
+        use_iou_aware=use_iou_aware,
+        use_cn_clip_bert=use_cn_clip_bert,
+        cn_clip_pretrain_path=cn_clip_pretrain_path,
+        cn_clip_use_checkpoint=cn_clip_use_checkpoint,
     )
 
     return model
-

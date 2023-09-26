@@ -144,3 +144,11 @@ grounding/version.py
 
 vis/
 tmp/
+
+groundingdino/version.py
+demo/*.sh
+test
+
+inference_*.py
+model_*.py
+performance.md
